@@ -88,7 +88,7 @@ The project simulates a multi-stage authentication and incident-response system 
 
 <div align="center">
 
-![Wiring Diagram](diagrams/smart-safe-wiring-diagram.png)
+![Wiring Diagram](diagrams/wiring-diagram.png)
 
 </div>
 
