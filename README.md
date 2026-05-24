@@ -7,7 +7,7 @@ An embedded security system built using Arduino, Raspberry Pi, and Python that c
 [![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)](raspberry-pi/main.py)
 [![Arduino](https://img.shields.io/badge/Arduino-00979D?style=for-the-badge&logo=arduino&logoColor=white)](arduino/smart_safe_arduino.ino)
 [![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-A22846?style=for-the-badge&logo=raspberrypi&logoColor=white)](raspberry-pi/main.py)
-[![CAD](https://img.shields.io/badge/CAD%20Files-FF6B00?style=for-the-badge)](cad/3D Rack Gear Slider.zip)
+[![CAD](https://img.shields.io/badge/CAD%20Files-FF6B00?style=for-the-badge)](cad/3d-gear-model.zip)
 </div>
 
 ---
