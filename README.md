@@ -3,12 +3,10 @@
 # Smart Safe Security System
 
 An embedded security system built using Arduino, Raspberry Pi, and Python that combines hardware-software integration, sensor-based authentication, real-time serial communication, and automated lock control into a fully interactive smart safe platform.
-
-[![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)]()
-[![Arduino](https://img.shields.io/badge/Arduino-00979D?style=for-the-badge&logo=arduino&logoColor=white)]()
-[![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-A22846?style=for-the-badge&logo=raspberrypi&logoColor=white)]()
-[![Embedded Systems](https://img.shields.io/badge/Embedded%20Systems-0A0A0A?style=for-the-badge)]()
-
+[![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)](raspberry-pi/main.py)
+[![Arduino](https://img.shields.io/badge/Arduino-00979D?style=for-the-badge&logo=arduino&logoColor=white)](arduino/smart_safe_arduino.ino)
+[![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-A22846?style=for-the-badge&logo=raspberrypi&logoColor=white)](raspberry-pi/main.py)
+[![CAD](https://img.shields.io/badge/CAD%20Files-FF6B00?style=for-the-badge)](cad/smart-safe-3d-models.zip)
 </div>
 
 ---
