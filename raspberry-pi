@@ -1,1 +1,1240 @@
+#!/usr/bin/env python3
+"""
+SECURE COLOR VERIFICATION (Pi UI)
+
+What this does:
+- Fullscreen Tkinter UI with animated neon background.
+- Stage 1: PIN keypad (max attempts + lockout).
+- Stage 2: Keycard scan button triggers Arduino COLOR? read.
+- Arduino responses drive actions: GREEN unlock, RED lock, BLUE police flash+siren, WHITE hard shutdown, UNKNOWN counted then meltdown.
+- Logs everything to a text file + in-app event log.
+
+Important threading rule:
+- Tkinter UI must not be blocked; long waits happen in background threads,
+  and UI updates are done using root.after(...) when needed.
+"""
+
+import tkinter as tk
+from tkinter import ttk
+import time, sys, random, threading, os
+from datetime import datetime
+ 
+# SETTINGS (core behavior)
+PIN_CODE = "6769420"          # correct PIN
+PIN_MAX_ATTEMPTS = 4          # total allowed PIN failures before meltdown
+PIN_LOCKOUT_AFTER = 3         # after this many wrong tries, trigger temporary lockout
+PIN_LOCKOUT_SECONDS = 15      # lockout duration in seconds
+
+SCAN_SETTLE_SECONDS = 3       # wait time before requesting Arduino COLOR?
+UNKNOWN_TRIGGER_COUNT = 2     # how many UNKNOWN reads before meltdown
+LOG_FILE = "color_ui_log.txt" # appended event log file
+
+EDGE_PAD = 26  # always show a border of the moving background (UI aesthetic padding)
+
+
+# SERIAL CONFIG
+BAUD = 9600
+TIMEOUT = 3.0
+AUTO_PORTS = ["/dev/ttyUSB0", "/dev/ttyACM0", "/dev/ttyUSB1", "/dev/ttyACM1"]
+
+# THEME COLORS (UI palette)
+BG = "#070A14"
+PANEL = "#070B14"
+CARD = "#0B1022"
+CARD2 = "#0A132B"
+BORDER = "#1A2A55"
+
+NEON_CYAN = "#37E6FF"
+NEON_GREEN = "#29FF9A"
+NEON_PURPLE = "#A855F7"
+NEON_BLUE = "#3B82F6"
+NEON_RED = "#FF3B5C"
+NEON_AMBER = "#FFC857"
+MUTED = "#A4B1D6"
+WHITE_TXT = "#EAF0FF"
+
+BTN_DARK = "#141B33"
+BTN_DARK_HI = "#1B2450"
+BTN_EXIT = "#4B5563"
+
+POP_W, POP_H = 360, 150  # popup window size
+
+# SERIAL (pyserial optional)
+SERIAL_OK = False
+ser = None
+PORT_IN_USE = None
+
+# Try importing pyserial; if missing, app still runs but scanning will fail.
+try:
+    import serial
+    SERIAL_OK = True
+except Exception:
+    SERIAL_OK = False
+
+
+def serial_disconnect():
+    """Close serial connection cleanly (if open)."""
+    global ser, PORT_IN_USE
+    try:
+        if ser and ser.is_open:
+            ser.close()
+    except Exception:
+        pass
+    ser = None
+    PORT_IN_USE = None
+
+
+def serial_autoconnect():
+    """
+    Attempt to auto-connect to Arduino over common Linux serial ports.
+
+    Returns:
+      (True, "OK (...)") on success
+      (False, "error message") on failure
+    """
+    global ser, PORT_IN_USE
+    if not SERIAL_OK:
+        return False, "pyserial not installed (sudo apt install -y python3-serial)"
+
+    # If already open, reuse it.
+    if ser and getattr(ser, "is_open", False):
+        return True, f"OK ({PORT_IN_USE})"
+
+    last_err = None
+    for p in AUTO_PORTS:
+        try:
+            ser = serial.Serial(p, BAUD, timeout=TIMEOUT)
+            PORT_IN_USE = p
+            time.sleep(1.4)  # Arduino resets when serial opens; wait for it to boot
+            return True, f"OK ({p})"
+        except Exception as e:
+            last_err = e
+            ser = None
+            PORT_IN_USE = None
+
+    return False, f"Auto-connect failed. Tried {AUTO_PORTS}. Last error: {last_err}"
+
+
+def arduino_send(cmd: str):
+    """
+    Send a command to Arduino (LOCK/UNLOCK/SIREN/BEEP/etc).
+    Tries to read a short acknowledgement line:
+      OK:...
+      ERR:...
+    If none seen, returns ("SENT") as best-effort.
+    """
+    ok, msg = serial_autoconnect()
+    if not ok:
+        return False, msg
+
+    try:
+        # Clear stale input so we don't read old lines.
+        try:
+            ser.reset_input_buffer()
+        except Exception:
+            pass
+
+        ser.write((cmd.strip().upper() + "\n").encode())
+        ser.flush()
+
+        # Read a few lines for a structured response.
+        for _ in range(10):
+            line = ser.readline().decode(errors="ignore").strip()
+            if not line:
+                continue
+            if line.startswith("OK:") or line.startswith("ERR:"):
+                return line.startswith("OK:"), line
+
+        return True, "SENT"
+    except Exception as e:
+        return False, f"Serial error: {e}"
+
+
+def arduino_request_color():
+    """
+    Ask Arduino for a color classification.
+    Expected Arduino response format:
+      COLOR:GREEN / COLOR:RED / COLOR:BLUE / COLOR:WHITE / COLOR:UNKNOWN
+
+    Returns:
+      (color_string, None) on success
+      (None, error_message) on failure
+    """
+    ok, msg = serial_autoconnect()
+    if not ok:
+        return None, msg
+
+    try:
+        try:
+            ser.reset_input_buffer()
+        except Exception:
+            pass
+
+        ser.write(b"COLOR?\n")
+        ser.flush()
+
+        # Try multiple reads (Arduino may take a moment).
+        for _ in range(30):
+            line = ser.readline().decode(errors="ignore").strip()
+            if not line:
+                continue
+            if line.startswith("COLOR:"):
+                return line.split(":", 1)[1].strip().upper(), None
+
+        return None, "No COLOR response"
+    except Exception as e:
+        return None, f"Serial error: {e}"
+
+
+# POPUPS / FLASH (visual alerts)
+def scattered_positions(root, count):
+    """
+    Generate random screen positions for multiple popups (scattered effect).
+    """
+    root.update_idletasks()
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+    min_x, max_x = 10, max(10, sw - POP_W - 10)
+    min_y, max_y = 10, max(10, sh - POP_H - 10)
+    return [(random.randint(min_x, max_x), random.randint(min_y, max_y)) for _ in range(count)]
+
+
+def popup_at(title, text, x, y, bg, fg, ms=500):
+    """
+    Create a temporary topmost popup window at (x,y), auto-destroy after ms.
+    """
+    w = tk.Toplevel()
+    w.title(title)
+    w.attributes("-topmost", True)
+    w.geometry(f"{POP_W}x{POP_H}+{x}+{y}")
+    w.configure(bg=bg)
+
+    lbl = tk.Label(
+        w, text=text, bg=bg, fg=fg,
+        font=("Arial", 13, "bold"),
+        justify="center", wraplength=POP_W - 20
+    )
+    lbl.pack(expand=True, fill="both", padx=10, pady=10)
+
+    w.after(ms, w.destroy)
+    return w
+
+
+def police_flash_sequence(root, cycles=26, speed_ms=105):
+    """
+    Flash alternating red/blue popups in the center (police light vibe).
+    Runs in a daemon thread to avoid freezing UI.
+    """
+    def run():
+        root.update_idletasks()
+        cx = (root.winfo_screenwidth() - POP_W) // 2
+        cy = (root.winfo_screenheight() - POP_H) // 2
+        for _ in range(cycles):
+            # Use root.after to create popups from the Tk thread.
+            root.after(0, lambda: popup_at("🚔 WARNING", "POLICE MODE", cx, cy, NEON_RED, "white", ms=speed_ms))
+            time.sleep(speed_ms / 1000.0)
+            root.after(0, lambda: popup_at("🚔 WARNING", "POLICE MODE", cx, cy, NEON_BLUE, "black", ms=speed_ms))
+            time.sleep(speed_ms / 1000.0)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+# BACKGROUND (animated neon)
+class NeonBackground(tk.Canvas):
+    """
+    Animated canvas:
+    - Moving neon "blobs" (large rings)
+    - Floating particles (small dots)
+    Renders every ~16ms (~60fps).
+    """
+    def __init__(self, parent):
+        parent.update_idletasks()
+        self.w = max(10, parent.winfo_width())
+        self.h = max(10, parent.winfo_height())
+        super().__init__(parent, width=self.w, height=self.h, bg=BG, highlightthickness=0)
+
+        self.particles = []
+        self.blobs = []
+        self._init_scene()
+        self.after(16, self._tick)
+
+    def _init_scene(self):
+        """Initialize blob positions and particle field."""
+        self.blobs = [
+            {"x": 0.20 * self.w, "y": 0.22 * self.h, "r": 0.46 * self.h, "dx": 0.22,  "dy": 0.16,  "c": NEON_PURPLE},
+            {"x": 0.82 * self.w, "y": 0.18 * self.h, "r": 0.42 * self.h, "dx": -0.20, "dy": 0.18,  "c": NEON_CYAN},
+            {"x": 0.84 * self.w, "y": 0.80 * self.h, "r": 0.52 * self.h, "dx": -0.16, "dy": -0.14, "c": NEON_BLUE},
+        ]
+
+        for _ in range(75):
+            self.particles.append({
+                "x": random.uniform(0, self.w),
+                "y": random.uniform(0, self.h),
+                "vx": random.uniform(-0.35, 0.35),
+                "vy": random.uniform(-0.35, 0.35),
+                "r": random.uniform(1.2, 2.6),
+                "c": random.choice([NEON_CYAN, NEON_BLUE, NEON_PURPLE, "#FFFFFF"])
+            })
+
+    def _tick(self):
+        """Render one frame: update positions, then redraw everything."""
+        self.delete("all")
+
+        # Draw moving blobs (concentric rings)
+        for b in self.blobs:
+            b["x"] += b["dx"]
+            b["y"] += b["dy"]
+
+            # bounce off screen with margin
+            if b["x"] < -80 or b["x"] > self.w + 80:
+                b["dx"] *= -1
+            if b["y"] < -80 or b["y"] > self.h + 80:
+                b["dy"] *= -1
+
+            x, y, r, c = b["x"], b["y"], b["r"], b["c"]
+            for k in range(5):
+                rr = r - k * 0.055 * self.h
+                if rr <= 0:
+                    continue
+                self.create_oval(x - rr, y - rr, x + rr, y + rr, outline=c, width=max(1, 5 - k))
+
+        # Draw particles (small filled circles)
+        for p in self.particles:
+            p["x"] += p["vx"]
+            p["y"] += p["vy"]
+            if p["x"] < 0 or p["x"] > self.w:
+                p["vx"] *= -1
+            if p["y"] < 0 or p["y"] > self.h:
+                p["vy"] *= -1
+
+            x, y, r = p["x"], p["y"], p["r"]
+            self.create_oval(x - r, y - r, x + r, y + r, outline="", fill=p["c"])
+
+        self.after(16, self._tick)
+
+
+# BUTTON (glow frame wrapper)
+def glow_button(parent, text, command, accent=NEON_CYAN, font_size=14):
+    """
+    Creates a "glow" style by nesting a colored outer frame around a dark button.
+    Returns:
+      (outer_frame, button_widget)
+    """
+    outer = tk.Frame(parent, bg=accent)
+    inner = tk.Frame(outer, bg=BG)
+
+    btn = tk.Button(
+        inner, text=text, command=command,
+        font=("Arial", font_size, "bold"),
+        bg=BTN_DARK, fg=WHITE_TXT,
+        activebackground=BTN_DARK_HI, activeforeground=WHITE_TXT,
+        relief="flat", bd=0,
+        padx=14, pady=10,
+        cursor="hand2"
+    )
+    inner.pack(padx=2, pady=2)
+    btn.pack(fill="x")
+    return outer, btn
+
+
+
+# APP (main UI + logic)
+class App:
+    def __init__(self, root):
+        # ---- root window configuration ----
+        self.root = root
+        self.root.title("SECURE COLOR VERIFICATION")
+        self.root.configure(bg=BG)
+        self.root.resizable(False, False)
+
+        # Fullscreen kiosk mode; Escape exits (for dev/testing).
+        self.root.attributes("-fullscreen", True)
+        self.root.bind("<Escape>", lambda e: self.exit_program())
+        self.root.protocol("WM_DELETE_WINDOW", self.exit_program)
+
+        # runtime state
+        self.serial_status = "Serial: connecting…"
+        self.lock_state = "LOCKED"
+
+        # Persisted log lines (for showing in UI later).
+        self.log_buffer = []
+        self.log_text = None
+
+        # PIN UI state
+        self.pin_entered = ""
+        self.pin_var = tk.StringVar(value="")      # shows masked pin or lockout text
+        self.pin_msg = tk.StringVar(value="")      # feedback like "wrong code"
+        self.pin_lock_var = tk.StringVar(value="") # lockout countdown text
+
+        self.pin_attempts = 0
+        self.pin_locked_until = 0.0
+        self.pin_key_buttons = []
+        self.pin_enter_btn = None
+
+        # references for shake/pulse effects
+        self._pinbox = None
+        self._pin_display_label = None
+
+        # scan logic state
+        self.unknown_count = 0
+        self.scanning = False
+
+        # ttk style
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("TProgressbar", thickness=16)
+
+        # container = whole app layout
+        self.container = tk.Frame(self.root, bg=BG)
+        self.container.pack(fill="both", expand=True)
+
+        # initial screen
+        self.build_home()
+        self.log_event("UI booted")
+
+        # start serial status polling shortly after boot
+        self.root.after(80, self.refresh_serial_status)
+
+    # background wrapper 
+    def make_bg_body(self):
+        """
+        Creates the animated background canvas and a padded wrapper
+        where main cards get placed.
+        """
+        self.container.grid_rowconfigure(0, weight=0)
+        self.container.grid_rowconfigure(1, weight=1)
+        self.container.grid_columnconfigure(0, weight=1)
+
+        body = tk.Frame(self.container, bg=BG)
+        body.grid(row=1, column=0, sticky="nsew")
+
+        bg = NeonBackground(body)
+        bg.place(x=0, y=0, relwidth=1, relheight=1)
+
+        # wrapper inset so background is visible around edges
+        wrapper = tk.Frame(body, bg=BG)
+        wrapper.place(
+            x=EDGE_PAD, y=EDGE_PAD,
+            relwidth=1, relheight=1,
+            width=-2 * EDGE_PAD, height=-2 * EDGE_PAD
+        )
+        wrapper.grid_rowconfigure(0, weight=1)
+        wrapper.grid_columnconfigure(0, weight=1)
+        return wrapper
+
+    # UI effects (shake + glow pulse) 
+    def shake_root(self, duration_ms=520, intensity=10, interval=22):
+        """
+        Shake the whole window by jittering its X/Y position.
+        (Works best when not in true fullscreen on some window managers.)
+        """
+        try:
+            self.root.update_idletasks()
+            base = self.root.geometry()  # "WxH+X+Y"
+            parts = base.split("+")
+            if len(parts) < 3:
+                return
+            wh = parts[0]
+            base_x = int(parts[1])
+            base_y = int(parts[2])
+        except Exception:
+            return
+
+        start = time.time()
+
+        def tick():
+            # stop after duration
+            if (time.time() - start) * 1000 >= duration_ms:
+                self.root.geometry(f"{wh}+{base_x}+{base_y}")
+                return
+            dx = random.randint(-intensity, intensity)
+            dy = random.randint(-intensity, intensity)
+            self.root.geometry(f"{wh}+{base_x + dx}+{base_y + dy}")
+            self.root.after(interval, tick)
+
+        tick()
+
+    def pulse_pinbox_red(self, pulses=6, interval=80):
+        """
+        Flash the PIN box border and PIN text red for quick wrong-PIN feedback.
+        """
+        if not self._pinbox or not self._pin_display_label:
+            return
+
+        state = {"on": False, "i": 0}
+        orig_border = BORDER
+        orig_fg = WHITE_TXT
+
+        def tick():
+            if not self._pinbox or not self._pin_display_label:
+                return
+
+            # finished all pulses -> restore colors
+            if state["i"] >= pulses:
+                try:
+                    self._pinbox.config(highlightbackground=orig_border)
+                    self._pin_display_label.config(fg=orig_fg)
+                except Exception:
+                    pass
+                return
+
+            state["on"] = not state["on"]
+            try:
+                self._pinbox.config(highlightbackground=(NEON_RED if state["on"] else orig_border))
+                self._pin_display_label.config(fg=(NEON_RED if state["on"] else orig_fg))
+            except Exception:
+                pass
+
+            state["i"] += 1
+            self.root.after(interval, tick)
+
+        tick()
+
+    # logging 
+    def log_event(self, msg):
+        """
+        Log to:
+        - in-memory buffer (for UI log viewer)
+        - LOG_FILE on disk (append)
+        - on-screen log widget if currently present
+        """
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {msg}"
+        self.log_buffer.append(line)
+
+        try:
+            with open(LOG_FILE, "a") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+        if self.log_text is not None and self.log_text.winfo_exists():
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", line + "\n")
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+
+    # serial
+    def refresh_serial_status(self):
+        """
+        Try to connect to Arduino and update the status label.
+        If it fails, retry every ~900ms.
+        """
+        ok, msg = serial_autoconnect()
+        self.serial_status = f"Serial: {'OK' if ok else 'FAIL'} — {msg}"
+        try:
+            self.status_lbl.config(text=self.serial_status)
+            self.serial_var.set(self.serial_status)
+        except Exception:
+            pass
+
+        if ok:
+            self.log_event(self.serial_status)
+        else:
+            self.root.after(900, self.refresh_serial_status)
+
+    # lifecycle 
+    def clear(self):
+        """Destroy all current UI in the container before building next screen."""
+        for w in self.container.winfo_children():
+            w.destroy()
+        self.log_text = None
+        self._pinbox = None
+        self._pin_display_label = None
+
+    def exit_program(self):
+        """
+        Exit handler:
+        - send LOCK to Arduino (servo safe position)
+        - close serial
+        - destroy Tk root
+        - sys.exit
+        """
+        self.log_event("EXIT -> locking servo then quitting")
+        try:
+            arduino_send("LOCK")
+        except Exception:
+            pass
+        serial_disconnect()
+
+        try:
+            self.root.destroy()
+        finally:
+            sys.exit(0)
+
+    def set_state(self, state):
+        """Update the state label color + text."""
+        self.lock_state = state
+        try:
+            self.state_lbl.config(
+                text=f"STATE: {state}",
+                fg=NEON_GREEN if state == "UNLOCKED" else NEON_RED
+            )
+        except Exception:
+            pass
+
+    def do_lock(self, why=""):
+        """Lock action: log, send LOCK to Arduino, update UI state."""
+        self.log_event(f"LOCK ({why})")
+        arduino_send("LOCK")
+        self.set_state("LOCKED")
+
+    def do_unlock(self, why=""):
+        """Unlock action: log, send UNLOCK to Arduino, update UI state."""
+        self.log_event(f"UNLOCK ({why})")
+        arduino_send("UNLOCK")
+        self.set_state("UNLOCKED")
+
+    # topbar 
+    def build_topbar(self, title):
+        """
+        The top panel shown on every screen:
+        - title
+        - state (LOCKED/UNLOCKED)
+        - serial status
+        """
+        top = tk.Frame(self.container, bg=PANEL)
+        top.grid(row=0, column=0, sticky="ew")
+        top.grid_columnconfigure(0, weight=1)
+
+        tk.Label(
+            top, text=title, bg=PANEL, fg=WHITE_TXT,
+            font=("Arial", 14, "bold")
+        ).grid(row=0, column=0, padx=14, pady=(10, 0), sticky="w")
+
+        self.state_lbl = tk.Label(
+            top, text=f"STATE: {self.lock_state}",
+            bg=PANEL, fg=NEON_RED, font=("Arial", 11, "bold")
+        )
+        self.state_lbl.grid(row=0, column=1, padx=14, pady=(10, 0), sticky="e")
+
+        self.status_lbl = tk.Label(
+            top, text=self.serial_status, bg=PANEL,
+            fg=MUTED, font=("Arial", 10, "bold")
+        )
+        self.status_lbl.grid(row=1, column=0, columnspan=2, padx=14, pady=(0, 10), sticky="w")
+
+    # HOME (landing screen)
+    def build_home(self):
+        """Home screen: shows status + safety rules + Begin/Exit."""
+        self.clear()
+        self.build_topbar("WELCOME")
+        wrap = self.make_bg_body()
+
+        shell = tk.Frame(wrap, bg=CARD, highlightbackground=BORDER, highlightthickness=3)
+        shell.grid(row=0, column=0, sticky="nsew")
+
+        shell.grid_rowconfigure(0, weight=1)
+        shell.grid_rowconfigure(1, weight=0)
+        shell.grid_columnconfigure(0, weight=1)
+
+        content = tk.Frame(shell, bg=CARD)
+        content.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
+
+        tk.Label(content, text="ARVIN’S SECURITY SUITE", bg=CARD, fg=NEON_CYAN,
+                 font=("Arial", 26, "bold")).pack(anchor="w", pady=(0, 6))
+        tk.Label(content, text="PIN → RGBW Keycard → Servo Lock → Incident Response",
+                 bg=CARD, fg=MUTED, font=("Arial", 11)).pack(anchor="w", pady=(0, 14))
+
+        # Serial status card
+        self.serial_var = tk.StringVar(value=self.serial_status)
+        link = tk.Frame(content, bg=CARD2, highlightbackground=BORDER, highlightthickness=2)
+        link.pack(fill="x", pady=(0, 12))
+        tk.Label(link, text="SYSTEM LINK", bg=CARD2, fg=MUTED, font=("Arial", 10, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
+        tk.Label(link, textvariable=self.serial_var, bg=CARD2, fg=WHITE_TXT, font=("Arial", 11, "bold")).pack(anchor="w", padx=10, pady=(0, 10))
+
+        # Rules card (UI reminder only; actual logic is in handle_color)
+        rules = tk.Frame(content, bg=CARD2, highlightbackground=BORDER, highlightthickness=2)
+        rules.pack(fill="x")
+        tk.Label(rules, text="SAFETY RULES", bg=CARD2, fg=WHITE_TXT, font=("Arial", 12, "bold")).pack(anchor="w", padx=10, pady=(8, 2))
+        tk.Label(
+            rules,
+            text="GREEN → UNLOCK (180°)\nRED → LOCK (0°)\nBLUE → POLICE FLASH + SIREN\nWHITE → HARD SHUTDOWN\nUNKNOWN x2 → MELTDOWN",
+            bg=CARD2, fg=MUTED, font=("Arial", 11), justify="left"
+        ).pack(anchor="w", padx=10, pady=(0, 10))
+
+        # Action buttons
+        bottom = tk.Frame(shell, bg=CARD)
+        bottom.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 14))
+        bottom.grid_columnconfigure(0, weight=1)
+        bottom.grid_columnconfigure(1, weight=1)
+
+        b1, _ = glow_button(bottom, "BEGIN", self.build_keypad, accent=NEON_GREEN, font_size=16)
+        b1.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        b2, _ = glow_button(bottom, "EXIT", self.exit_program, accent=NEON_RED, font_size=16)
+        b2.grid(row=0, column=1, sticky="ew", padx=(10, 0))
+
+    # PIN MELTDOWN (4 wrong attempts)
+    def pin_meltdown(self):
+        """
+        Triggered when PIN_MAX_ATTEMPTS reached.
+        - siren
+        - lots of popups
+        - hard exit using os._exit (force-kill)
+        """
+        self.log_event("*** PIN MELTDOWN TRIGGERED (4 wrong attempts) ***")
+        try:
+            arduino_send("SIREN")
+        except Exception:
+            pass
+
+        positions = scattered_positions(self.root, 18)
+        for i, (x, y) in enumerate(positions, start=1):
+            popup_at("ACCESS DENIED", f"PIN FAILURE\n\nATTEMPTS EXCEEDED\n\nPOPUP {i}/18", x, y, NEON_RED, "white", ms=850)
+            self.root.update_idletasks()
+            time.sleep(0.04)
+
+        self.root.after(200, lambda: os._exit(0))
+
+    # KEYPAD / PIN screen
+    def build_keypad(self):
+        """
+        Builds the PIN entry UI:
+        - masked PIN display
+        - keypad buttons
+        - lockout countdown after PIN_LOCKOUT_AFTER
+        - melts down after PIN_MAX_ATTEMPTS
+        """
+        self.clear()
+        self.build_topbar("AUTHENTICATION")
+        wrap = self.make_bg_body()
+
+        shell = tk.Frame(wrap, bg=CARD, highlightbackground=BORDER, highlightthickness=3)
+        shell.grid(row=0, column=0, sticky="nsew")
+
+        shell.grid_columnconfigure(0, weight=3, uniform="cols")
+        shell.grid_columnconfigure(1, weight=2, uniform="cols")
+        shell.grid_rowconfigure(0, weight=0)
+        shell.grid_rowconfigure(1, weight=1)
+
+        title = tk.Frame(shell, bg=CARD)
+        title.grid(row=0, column=0, columnspan=2, sticky="ew", padx=14, pady=(12, 8))
+        tk.Label(title, text="ENTER ACCESS CODE", bg=CARD, fg=NEON_CYAN, font=("Arial", 20, "bold")).pack(anchor="w")
+
+        left = tk.Frame(shell, bg=CARD)
+        left.grid(row=1, column=0, sticky="nsew", padx=(14, 7), pady=(0, 14))
+        right = tk.Frame(shell, bg=CARD)
+        right.grid(row=1, column=1, sticky="nsew", padx=(7, 14), pady=(0, 14))
+
+        # Reset PIN-related state for a fresh keypad screen.
+        self.pin_entered = ""
+        self.pin_var.set("")
+        self.pin_msg.set("")
+        self.pin_lock_var.set("")
+        self.pin_key_buttons = []
+        self.pin_enter_btn = None
+
+        # PIN display panel
+        pinbox = tk.Frame(left, bg=CARD2, highlightbackground=BORDER, highlightthickness=2)
+        pinbox.pack(fill="x")
+        self._pinbox = pinbox
+
+        tk.Label(pinbox, text="ACCESS CODE", bg=CARD2, fg=MUTED, font=("Arial", 10, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
+
+        pin_display = tk.Label(
+            pinbox, textvariable=self.pin_var,
+            bg=CARD2, fg=WHITE_TXT,
+            font=("Courier", 18, "bold"),
+            anchor="w"
+        )
+        pin_display.pack(fill="x", padx=10, pady=(0, 8))
+        self._pin_display_label = pin_display
+
+        # Feedback row: left = messages, right = lockout countdown
+        msgrow = tk.Frame(left, bg=CARD)
+        msgrow.pack(fill="x", pady=(8, 6))
+        tk.Label(msgrow, textvariable=self.pin_msg, bg=CARD, fg=NEON_AMBER, font=("Arial", 11, "bold")).pack(side="left")
+        tk.Label(msgrow, textvariable=self.pin_lock_var, bg=CARD, fg=NEON_RED, font=("Arial", 11, "bold")).pack(side="right")
+
+        # Keypad area
+        pad = tk.Frame(left, bg=CARD2, highlightbackground=BORDER, highlightthickness=2)
+        pad.pack(fill="both", expand=True)
+
+        grid = tk.Frame(pad, bg=CARD2)
+        grid.pack(fill="both", expand=True, padx=10, pady=10)
+
+        for r in range(4):
+            grid.grid_rowconfigure(r, weight=1, uniform="r")
+        for c in range(3):
+            grid.grid_columnconfigure(c, weight=1, uniform="c")
+
+        # Key font scales down for 480p screens
+        key_font = ("Arial", 15 if self.root.winfo_screenheight() <= 480 else 18, "bold")
+
+        def locked_now():
+            """True if currently in lockout window."""
+            return time.time() < self.pin_locked_until
+
+        def set_keypad_enabled(enabled: bool):
+            """Enable/disable all keypad buttons + enter button."""
+            for b in self.pin_key_buttons:
+                try:
+                    b.config(state=("normal" if enabled else "disabled"))
+                except Exception:
+                    pass
+            if self.pin_enter_btn is not None:
+                try:
+                    self.pin_enter_btn.config(state=("normal" if enabled else "disabled"))
+                except Exception:
+                    pass
+
+        def start_lockout(seconds: int):
+            """
+            Start a temporary lockout:
+            - disables keypad
+            - updates countdown every 200ms
+            - displays "LOCKED Ns" in the pin bar
+            """
+            self.pin_locked_until = time.time() + seconds
+            set_keypad_enabled(False)
+
+            def tick():
+                rem = int(self.pin_locked_until - time.time())
+                if rem <= 0:
+                    # lockout over -> restore UI
+                    self.pin_lock_var.set("")
+                    self.pin_var.set("")
+                    try:
+                        self._pinbox.config(highlightbackground=BORDER)
+                        self._pin_display_label.config(fg=WHITE_TXT)
+                    except Exception:
+                        pass
+                    set_keypad_enabled(True)
+                    return
+
+                # lockout replaces the PIN bar text
+                self.pin_var.set(f"LOCKED {rem}s")
+                self.pin_lock_var.set(f"LOCKOUT: {rem}s")
+                try:
+                    self._pinbox.config(highlightbackground=NEON_RED)
+                    self._pin_display_label.config(fg=NEON_RED)
+                except Exception:
+                    pass
+
+                self.root.after(200, tick)
+
+            tick()
+
+        def add_digit(d):
+            """Append a digit to the PIN entry (masked bullets)."""
+            if locked_now():
+                return
+            if len(self.pin_entered) >= 10:  # guard against super long pin
+                return
+            self.pin_entered += str(d)
+            self.pin_var.set("•" * len(self.pin_entered))
+            self.pin_msg.set("")
+
+        def clear_pin():
+            """Clear the current PIN entry."""
+            if locked_now():
+                return
+            self.pin_entered = ""
+            self.pin_var.set("")
+            self.pin_msg.set("")
+
+        def backspace():
+            """Remove last digit."""
+            if locked_now():
+                return
+            self.pin_entered = self.pin_entered[:-1]
+            self.pin_var.set("•" * len(self.pin_entered))
+            self.pin_msg.set("")
+
+        def wrong_pin_feedback():
+            """
+            Wrong PIN animation:
+            - show "INCORRECT" temporarily
+            - shake window
+            - pulse red border/text
+            """
+            self.pin_var.set("INCORRECT")
+            self.shake_root(duration_ms=520, intensity=10, interval=22)
+            self.pulse_pinbox_red(pulses=8, interval=70)
+
+            def reset_pin_display():
+                self.pin_entered = ""
+                self.pin_var.set("")
+            self.root.after(900, reset_pin_display)
+
+        def submit_pin():
+            """Validate pin, manage attempts + lockout + meltdown."""
+            if locked_now():
+                return
+
+            # Correct PIN -> proceed to keycard scan screen
+            if self.pin_entered == PIN_CODE:
+                self.log_event("PIN accepted")
+                self.pin_msg.set("ACCESS GRANTED")
+                try:
+                    self._pinbox.config(highlightbackground=BORDER)
+                    self._pin_display_label.config(fg=WHITE_TXT)
+                except Exception:
+                    pass
+                self.root.after(250, self.build_keycard)
+                return
+
+            # Wrong PIN path
+            self.pin_attempts += 1
+            self.log_event(f"PIN denied (attempt {self.pin_attempts}/{PIN_MAX_ATTEMPTS})")
+            self.pin_msg.set(f"WRONG CODE ({self.pin_attempts}/{PIN_MAX_ATTEMPTS})")
+
+            # Make Arduino beep if available
+            try:
+                arduino_send("BEEP")
+            except Exception:
+                pass
+
+            wrong_pin_feedback()
+
+            # Lockout after PIN_LOCKOUT_AFTER
+            if self.pin_attempts == PIN_LOCKOUT_AFTER:
+                self.log_event(f"PIN lockout {PIN_LOCKOUT_SECONDS}s")
+                start_lockout(PIN_LOCKOUT_SECONDS)
+                return
+
+            # Meltdown after max attempts
+            if self.pin_attempts >= PIN_MAX_ATTEMPTS:
+                self.pin_meltdown()
+                return
+
+        def mkbtn(txt, cmd):
+            """Helper to create keypad buttons with consistent style."""
+            b = tk.Button(
+                grid, text=txt, command=cmd, font=key_font,
+                bg=BTN_DARK, fg=WHITE_TXT,
+                activebackground=BTN_DARK_HI, activeforeground=WHITE_TXT,
+                relief="flat", bd=0, cursor="hand2"
+            )
+            self.pin_key_buttons.append(b)
+            return b
+
+        # Layout for keypad: numbers + clear + backspace
+        keys = [
+            ("1", lambda: add_digit(1)), ("2", lambda: add_digit(2)), ("3", lambda: add_digit(3)),
+            ("4", lambda: add_digit(4)), ("5", lambda: add_digit(5)), ("6", lambda: add_digit(6)),
+            ("7", lambda: add_digit(7)), ("8", lambda: add_digit(8)), ("9", lambda: add_digit(9)),
+            ("C", clear_pin),            ("0", lambda: add_digit(0)), ("⌫", backspace),
+        ]
+
+        i = 0
+        for r in range(4):
+            for c in range(3):
+                label, fn = keys[i]
+                b = mkbtn(label, fn)
+                b.grid(row=r, column=c, sticky="nsew", padx=6, pady=6)
+                i += 1
+
+        # RIGHT column: system link + rules + actions (ENTER/HOME/EXIT)
+        right.grid_rowconfigure(0, weight=0)
+        right.grid_rowconfigure(1, weight=1)
+        right.grid_rowconfigure(2, weight=0)
+        right.grid_columnconfigure(0, weight=1)
+
+        sys_card = tk.Frame(right, bg=CARD2, highlightbackground=BORDER, highlightthickness=2)
+        sys_card.grid(row=0, column=0, sticky="ew")
+
+        self.serial_var = tk.StringVar(value=self.serial_status)
+        tk.Label(sys_card, text="SYSTEM LINK", bg=CARD2, fg=MUTED, font=("Arial", 10, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
+        tk.Label(
+            sys_card, textvariable=self.serial_var, bg=CARD2, fg=WHITE_TXT,
+            font=("Arial", 11, "bold"), wraplength=360, justify="left"
+        ).pack(anchor="w", padx=10, pady=(0, 10))
+
+        rules = tk.Frame(right, bg=CARD2, highlightbackground=BORDER, highlightthickness=2)
+        rules.grid(row=1, column=0, sticky="nsew", pady=10)
+        tk.Label(rules, text="SAFETY RULES", bg=CARD2, fg=WHITE_TXT, font=("Arial", 12, "bold")).pack(anchor="w", padx=10, pady=(8, 2))
+        tk.Label(
+            rules,
+            text="GREEN → UNLOCK\nRED → LOCK\nBLUE → POLICE\nWHITE → SHUTDOWN\nUNKNOWN x2 → MELTDOWN",
+            bg=CARD2, fg=MUTED, font=("Arial", 11), justify="left"
+        ).pack(anchor="w", padx=10, pady=(0, 10))
+
+        actionbar = tk.Frame(right, bg=CARD)
+        actionbar.grid(row=2, column=0, sticky="ew")
+        actionbar.grid_columnconfigure(0, weight=1)
+
+        a1, btn_enter = glow_button(actionbar, "ENTER", submit_pin, accent=NEON_GREEN, font_size=15)
+        a1.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        self.pin_enter_btn = btn_enter
+
+        a2, _ = glow_button(actionbar, "HOME", self.build_home, accent=NEON_CYAN, font_size=15)
+        a2.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+
+        a3, _ = glow_button(actionbar, "EXIT", self.exit_program, accent=NEON_RED, font_size=15)
+        a3.grid(row=2, column=0, sticky="ew")
+
+    # KEYCARD SCAN screen
+    def build_keycard(self):
+        """
+        Keycard scan UI:
+        - Start Scan triggers settle progress + Arduino COLOR?
+        - Big label shows detected color
+        - Event log panel shows history
+        """
+        self.clear()
+        self.build_topbar("KEYCARD SCAN")
+        wrap = self.make_bg_body()
+
+        shell = tk.Frame(wrap, bg=CARD, highlightbackground=BORDER, highlightthickness=3)
+        shell.grid(row=0, column=0, sticky="nsew")
+
+        shell.grid_columnconfigure(0, weight=3, uniform="cols")
+        shell.grid_columnconfigure(1, weight=2, uniform="cols")
+        shell.grid_rowconfigure(0, weight=1)
+
+        left = tk.Frame(shell, bg=CARD)
+        left.grid(row=0, column=0, sticky="nsew", padx=(14, 7), pady=14)
+        right = tk.Frame(shell, bg=CARD)
+        right.grid(row=0, column=1, sticky="nsew", padx=(7, 14), pady=14)
+
+        tk.Label(left, text="COLOR SCANNER", bg=CARD, fg=NEON_CYAN, font=("Arial", 18, "bold")).pack(anchor="w")
+        tk.Label(left, text="Press START SCAN manually each time.", bg=CARD, fg=MUTED, font=("Arial", 10)).pack(anchor="w", pady=(0, 6))
+
+        self.scan_status_var = tk.StringVar(value="Ready.")
+        tk.Label(left, textvariable=self.scan_status_var, bg=CARD, fg=WHITE_TXT, font=("Arial", 12, "bold")).pack(anchor="w", pady=(0, 6))
+
+        # Progress bar shows settle time
+        self.bar = ttk.Progressbar(left, orient="horizontal", mode="determinate")
+        self.bar.pack(fill="x", pady=(0, 10))
+
+        # Buttons row
+        btn_row = tk.Frame(left, bg=CARD)
+        btn_row.pack(fill="x", pady=(0, 10))
+
+        self.btn_scan = tk.Button(
+            btn_row, text="START SCAN", command=self.start_scan,
+            font=("Arial", 13, "bold"),
+            bg=BTN_DARK, fg=WHITE_TXT,
+            activebackground=BTN_DARK_HI, activeforeground=WHITE_TXT,
+            relief="flat", bd=0, padx=14, pady=10, cursor="hand2"
+        )
+        self.btn_scan.pack(side="left", padx=(0, 8))
+
+        tk.Button(
+            btn_row, text="LOG OUT", command=self.build_keypad,
+            font=("Arial", 13, "bold"),
+            bg=BTN_DARK, fg=WHITE_TXT,
+            activebackground=BTN_DARK_HI, activeforeground=WHITE_TXT,
+            relief="flat", bd=0, padx=14, pady=10, cursor="hand2"
+        ).pack(side="left", padx=(0, 8))
+
+        tk.Button(
+            btn_row, text="EXIT", command=self.exit_program,
+            font=("Arial", 13, "bold"),
+            bg=BTN_EXIT, fg="white",
+            activebackground=BTN_EXIT, relief="flat", bd=0,
+            padx=14, pady=10, cursor="hand2"
+        ).pack(side="left")
+
+        # Big detected color display
+        self.big_color_var = tk.StringVar(value="—")
+        self.big_color_lbl = tk.Label(
+            left, textvariable=self.big_color_var,
+            bg=CARD2, fg=WHITE_TXT,
+            font=("Arial", 34, "bold"),
+            anchor="center"
+        )
+        self.big_color_lbl.pack(fill="x", pady=(12, 10))
+
+        # Right panel = event log
+        box = tk.Frame(right, bg=CARD2, highlightbackground=BORDER, highlightthickness=2)
+        box.pack(fill="both", expand=True)
+
+        tk.Label(box, text="EVENT LOG", bg=CARD2, fg=WHITE_TXT, font=("Arial", 12, "bold")).pack(anchor="w", padx=10, pady=(10, 2))
+        self.last_color_var = tk.StringVar(value="Last read: —")
+        tk.Label(box, textvariable=self.last_color_var, bg=CARD2, fg=NEON_AMBER, font=("Arial", 11, "bold")).pack(anchor="w", padx=10, pady=(0, 8))
+
+        tf = tk.Frame(box, bg=CARD2)
+        tf.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        scroll = tk.Scrollbar(tf)
+        scroll.pack(side="right", fill="y")
+
+        self.log_text = tk.Text(
+            tf, wrap="word",
+            bg="#060A18", fg=WHITE_TXT,
+            insertbackground=WHITE_TXT,
+            font=("Courier", 10),
+            yscrollcommand=scroll.set,
+            bd=0, highlightthickness=0
+        )
+        self.log_text.pack(side="left", fill="both", expand=True)
+        scroll.config(command=self.log_text.yview)
+
+        # Populate log with recent history
+        self.log_text.configure(state="normal")
+        for line in self.log_buffer[-250:]:
+            self.log_text.insert("end", line + "\n")
+        self.log_text.configure(state="disabled")
+        self.log_text.see("end")
+
+    # SCAN FLOW (threaded)
+    def start_scan(self):
+        """
+        Start one scan:
+        - ensure serial ready
+        - disable button while scanning
+        - show settle progress (in a thread)
+        - request Arduino COLOR?
+        - return result to UI via root.after
+        """
+        if self.scanning:
+            return
+
+        ok, msg = serial_autoconnect()
+        if not ok:
+            self.log_event(f"Cannot scan: {msg}")
+            self.scan_status_var.set("Serial not ready.")
+            return
+
+        self.scanning = True
+        self.btn_scan.config(state="disabled")
+        self.scan_status_var.set(f"Stabilizing… {SCAN_SETTLE_SECONDS}s")
+        self.bar["value"] = 0
+
+        def run():
+            # settle countdown (progress bar)
+            total = SCAN_SETTLE_SECONDS * 100
+            for i in range(total + 1):
+                self.bar["value"] = (i / total) * 100
+                time.sleep(0.01)
+
+            # UI updates must happen in Tk thread:
+            self.root.after(0, lambda: self.scan_status_var.set("Reading…"))
+            self.log_event("Requesting COLOR? from Arduino")
+
+            # Serial request
+            val, err = arduino_request_color()
+
+            # handle result on UI thread
+            self.root.after(0, lambda: self.handle_color(val, err))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _reenable_scan(self):
+        """Reset scan state and re-enable scan button."""
+        self.scanning = False
+        try:
+            self.btn_scan.config(state="normal")
+        except Exception:
+            pass
+        try:
+            self.bar["value"] = 0
+        except Exception:
+            pass
+
+    def meltdown(self, reason):
+        """
+        General meltdown:
+        - log
+        - siren
+        - popups
+        - hard exit
+        """
+        self.log_event(f"*** MELTDOWN TRIGGERED: {reason} ***")
+        arduino_send("SIREN")
+
+        positions = scattered_positions(self.root, 16)
+        for i, (x, y) in enumerate(positions, start=1):
+            popup_at("SYSTEM ALERT", f"{reason}\n\nPOPUP {i}/16", x, y, NEON_RED, "white", ms=900)
+            self.root.update_idletasks()
+            time.sleep(0.045)
+
+        self.root.after(200, lambda: os._exit(0))
+
+    def handle_color(self, val, err):
+        """
+        Interpret Arduino color result and trigger system actions.
+        """
+        self._reenable_scan()
+
+        # If serial request failed
+        if err:
+            self.log_event(f"Scan error: {err}")
+            self.last_color_var.set("Last read: (error)")
+            self.big_color_var.set("ERROR")
+            self.big_color_lbl.config(bg=CARD2, fg=NEON_RED)
+            self.scan_status_var.set("Error. Press START SCAN again.")
+            return
+
+        # Successful read
+        self.log_event(f"Arduino returned: {val}")
+        self.last_color_var.set(f"Last read: {val}")
+
+        # Update big display colors
+        self.big_color_var.set(val)
+        bg_map = {"GREEN":"#052418","RED":"#2A0B12","BLUE":"#071A2B","WHITE":"#E5E7EB","UNKNOWN":"#2A1B0B"}
+        fg_map = {"GREEN":NEON_GREEN,"RED":NEON_RED,"BLUE":NEON_BLUE,"WHITE":"#111827","UNKNOWN":NEON_AMBER}
+        self.big_color_lbl.config(bg=bg_map.get(val, CARD2), fg=fg_map.get(val, WHITE_TXT))
+
+        # WHITE = immediate lock + hard shutdown meltdown
+        if val == "WHITE":
+            self.do_lock("WHITE detected")
+            self.scan_status_var.set("WHITE detected — hard shutdown.")
+            self.meltdown("WHITE DETECTED — HARD SHUTDOWN")
+            return
+
+        # GREEN = unlock
+        if val == "GREEN":
+            self.unknown_count = 0
+            self.do_unlock("GREEN detected")
+            self.scan_status_var.set("GREEN detected — unlocked.")
+            popup_at("ACCESS", "GREEN DETECTED\nUNLOCKED", 30, 30, "#082A18", NEON_GREEN, ms=1100)
+            return
+
+        # RED = lock
+        if val == "RED":
+            self.unknown_count = 0
+            self.do_lock("RED detected")
+            self.scan_status_var.set("RED detected — locked.")
+            popup_at("LOCK", "RED DETECTED\nLOCKED", 30, 30, "#2A0B12", "white", ms=1100)
+            return
+
+        # BLUE = police warning
+        if val == "BLUE":
+            self.unknown_count = 0
+            self.do_lock("BLUE detected")
+            self.scan_status_var.set("BLUE detected — police warning.")
+            self.log_event("BLUE => police flash + siren")
+            arduino_send("SIREN")
+            police_flash_sequence(self.root, cycles=26, speed_ms=105)
+            return
+
+        # UNKNOWN = lock, count attempts, then meltdown at threshold
+        if val == "UNKNOWN":
+            self.do_lock("UNKNOWN detected")
+            self.unknown_count += 1
+
+            # First UNKNOWN: beep and ask to scan again
+            if self.unknown_count < UNKNOWN_TRIGGER_COUNT:
+                arduino_send("BEEP")
+                self.log_event(f"UNKNOWN ({self.unknown_count}/{UNKNOWN_TRIGGER_COUNT})")
+                self.scan_status_var.set(f"UNKNOWN ({self.unknown_count}/{UNKNOWN_TRIGGER_COUNT}) — scan again.")
+                popup_at(
+                    "⚠ UNKNOWN",
+                    f"UNKNOWN ({self.unknown_count}/{UNKNOWN_TRIGGER_COUNT})\nScan again.",
+                    30, 30, "#2A1B0B", NEON_AMBER, ms=1300
+                )
+                return
+
+            # Second UNKNOWN: meltdown
+            self.scan_status_var.set("UNKNOWN twice — meltdown.")
+            self.meltdown("UNKNOWN DETECTED TWICE")
+            return
+# RUN (entry point)
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = App(root)
+    try:
+        root.mainloop()
+    finally:
+        # always close serial on exit/crash
+        serial_disconnect()
+
+
+
 
